@@ -380,7 +380,7 @@ def _dart_get_cum_sales_by_fs(corp_code: str, year: int, reprt_code: str, fs_div
 
 
 def dart_get_cum_sales(corp_code: str, year: int, reprt_code: str) -> Optional[int]:
-    """연결(CFS) 우선, 없으면 별도(OFS)로 매출액 조회."""
+    """연결(CFS) 우선, 없으면 별도(OFS)로 해당 보고서의 매출액(thstrm_amount) 조회."""
     cfs = _dart_get_cum_sales_by_fs(corp_code, year, reprt_code, "CFS")
     if cfs is not None:
         return cfs
@@ -392,26 +392,22 @@ def quarter_index_from_reprt(reprt_code: str) -> int:
 
 
 def derive_quarter_sales(corp_code: str, year: int, q: int) -> Optional[int]:
+    # fnlttSinglAcntAll의 thstrm_amount는 분/반기 보고서에서 "해당 분기" 금액이다.
+    # 따라서 Q1~Q3는 차감 복원이 아니라 각 보고서의 thstrm_amount를 직접 사용한다.
     if q == 1:
         return dart_get_cum_sales(corp_code, year, "11013")
     if q == 2:
-        h1 = dart_get_cum_sales(corp_code, year, "11012")
-        q1 = dart_get_cum_sales(corp_code, year, "11013")
-        if h1 is None or q1 is None:
-            return None
-        return h1 - q1
+        return dart_get_cum_sales(corp_code, year, "11012")
     if q == 3:
-        q3cum = dart_get_cum_sales(corp_code, year, "11014")
-        h1 = dart_get_cum_sales(corp_code, year, "11012")
-        if q3cum is None or h1 is None:
-            return None
-        return q3cum - h1
+        return dart_get_cum_sales(corp_code, year, "11014")
     if q == 4:
         fy = dart_get_cum_sales(corp_code, year, "11011")
-        q3cum = dart_get_cum_sales(corp_code, year, "11014")
-        if fy is None or q3cum is None:
+        q1 = dart_get_cum_sales(corp_code, year, "11013")
+        q2 = dart_get_cum_sales(corp_code, year, "11012")
+        q3 = dart_get_cum_sales(corp_code, year, "11014")
+        if fy is None or q1 is None or q2 is None or q3 is None:
             return None
-        return fy - q3cum
+        return fy - q1 - q2 - q3
     return None
 
 
@@ -448,7 +444,8 @@ def reprt_code_from_report_nm(report_nm: str) -> Optional[str]:
         if period_month == 3:
             return "11013"
         if period_month == 12:
-            return "11011"
+            # 결산월이 3월인 법인의 3분기(12월말) 케이스가 많음
+            return "11014"
         if period_month == 9:
             return "11014"
         if "1분기" in nm:
@@ -545,6 +542,24 @@ def is_periodic_report(item: Dict) -> bool:
     return ("분기보고서" in nm) or ("반기보고서" in nm) or ("사업보고서" in nm)
 
 
+KW_ASSET_TRANSFER = [
+    "자산양수도", "자산 양수도",
+    "자산양수", "자산 양수",
+    "자산양도", "자산 양도",
+    "영업양수도", "영업 양수도",
+    "영업양수", "영업 양수",
+    "영업양도", "영업 양도",
+]
+
+
+def is_asset_transfer_report(item: Dict) -> Tuple[bool, str]:
+    nm = str(item.get("report_nm", ""))
+    for kw in KW_ASSET_TRANSFER:
+        if kw in nm:
+            return True, kw
+    return False, ""
+
+
 # ====== 메인 ======
 def main(target_date: Optional[str] = None):
     if not DART_API_KEY:
@@ -570,6 +585,7 @@ def main(target_date: Optional[str] = None):
     major_hits: List[Dict] = []
     type2_hits: List[Dict] = []
     type3_hits: List[Dict] = []
+    asset_hits: List[Dict] = []
 
     for it in items:
         corp = str(it.get("corp_name", "")).strip()
@@ -619,105 +635,109 @@ def main(target_date: Optional[str] = None):
                     "this": this_sales, "prev": prev_sales, "yoybase": yoy_sales,
                     "qoq": qoq_p, "yoy": yoy_p
                 })
+            continue
 
-    passed_count = len(major_hits) + len(type2_hits) + len(type3_hits)
+        # (4) 자산양수도 공시
+        is_asset, kw = is_asset_transfer_report(it)
+        if is_asset:
+            asset_hits.append({
+                "corp": corp, "stock": stock, "report": report_nm,
+                "date": rcept_dt, "link": link, "why": kw
+            })
+            continue
 
-    # ===== 메시지 구성 =====
-    lines: List[str] = []
-    lines.append(f"📌 DART 필터 리포트 (KST {today})")
-    lines.append(f"총 공시 {total_count}건 | 필터 통과 {passed_count}건")
-    lines.append("")
+    passed_count = len(major_hits) + len(type2_hits) + len(type3_hits) + len(asset_hits)
 
-    def add_section_major(title: str, arr: List[Dict]):
-        lines.append(f"== {title} ({len(arr)}건) ==")
-        if not arr:
-            lines.append("- 없음")
-            lines.append("")
-            return
+    # ===== 메시지 구성: 공시 1건당 1메시지 =====
+    summary = (
+        f"📌 DART 필터 리포트 (KST {today})\n"
+        f"총 공시 {total_count}건 | 필터 통과 {passed_count}건\n"
+        "발송 방식: 공시 1건당 1메시지"
+    )
+    tg_send(summary, chat_id)
 
-        for x in arr:
-            corp = x["corp"]
-            stock = x.get("stock", "")
-            lines.append(f"- {corp}" + (f" ({stock})" if stock else ""))
+    def build_major_message(x: Dict) -> str:
+        corp = x["corp"]
+        stock = x.get("stock", "")
+        actor = (x.get("actor") or "").strip()
+        ps = x.get("prev_sh")
+        af = x.get("after_sh")
+        ds = x.get("delta_sh")
+        pr = x.get("prev_r")
+        ar = x.get("after_r")
+        dp = x.get("delta_pp")
 
-            # 늘어난 주체(보고의무자)
-            actor = (x.get("actor") or "").strip()
-            lines.append(f"  · 주체(보고의무자): {actor if actor else 'N/A'}")
+        lines = [f"① 대량보유 | {corp}" + (f" ({stock})" if stock else "")]
+        lines.append(f"· 주체(보고의무자): {actor if actor else 'N/A'}")
+        lines.append(f"· 사유분류: {x.get('why','')}")
+        lines.append(f"· 상세사유: {x.get('reason_text','') or 'N/A'}")
+        if ps is not None and af is not None and ds is not None:
+            sign = "+" if ds > 0 else ""
+            lines.append(f"· 주식수 변동: {fmt_shares(ps)} → {fmt_shares(af)} ({sign}{fmt_shares(ds)})")
+        elif ds is not None:
+            sign = "+" if ds > 0 else ""
+            lines.append(f"· 주식수 변동: {sign}{fmt_shares(ds)}")
+        else:
+            lines.append("· 주식수 변동: N/A")
+        if pr is not None and ar is not None and dp is not None:
+            lines.append(f"· 보유비율 변동: {fmt_ratio(pr)} → {fmt_ratio(ar)} ({fmt_pp(dp)})")
+        elif pr is not None and ar is not None:
+            lines.append(f"· 보유비율 변동: {fmt_ratio(pr)} → {fmt_ratio(ar)}")
+        elif dp is not None:
+            lines.append(f"· 보유비율 변동: {fmt_pp(dp)}")
+        else:
+            lines.append("· 보유비율 변동: N/A")
+        lines.append(f"· 공시: {x.get('report','')}")
+        lines.append(f"· 링크: {x.get('link','')}")
+        return "\n".join(lines)
 
-            lines.append(f"  · 사유분류: {x.get('why','')}")
-            lines.append(f"  · 상세사유: {x.get('reason_text','') or 'N/A'}")
+    def build_type2_message(x: Dict) -> str:
+        corp = x["corp"]
+        stock = x.get("stock", "")
+        lines = [f"② 손익구조 이상변경 | {corp}" + (f" ({stock})" if stock else "")]
+        lines.append(f"· 공시: {x.get('report','')}")
+        lines.append(f"· 연매출: 전기 {fmt_money(x.get('prev'))} → 당기 {fmt_money(x.get('this'))}")
+        lines.append(f"· YoY: {fmt_pct(x.get('yoy'))}")
+        lines.append(f"· 링크: {x.get('link','')}")
+        return "\n".join(lines)
 
-            # 주식수 변동(전→후(±))
-            ps = x.get("prev_sh")
-            af = x.get("after_sh")
-            ds = x.get("delta_sh")
-            if ps is not None and af is not None and ds is not None:
-                sign = "+" if ds > 0 else ""
-                lines.append(f"  · 주식수 변동: {fmt_shares(ps)} → {fmt_shares(af)} ({sign}{fmt_shares(ds)})")
-            elif ds is not None:
-                sign = "+" if ds > 0 else ""
-                lines.append(f"  · 주식수 변동: {sign}{fmt_shares(ds)}")
-            else:
-                lines.append("  · 주식수 변동: N/A")
+    def build_type3_message(x: Dict) -> str:
+        corp = x["corp"]
+        stock = x.get("stock", "")
+        lines = [f"③ 정기보고서 | {corp}" + (f" ({stock})" if stock else "")]
+        lines.append(f"· 공시: {x.get('report','')}")
+        lines.append(
+            f"· 분기매출: 전분기 {fmt_money(x.get('prev'))} → 이번분기 {fmt_money(x.get('this'))} | 전년동기 {fmt_money(x.get('yoybase'))}"
+        )
+        lines.append(f"· QoQ: {fmt_pct(x.get('qoq'))} | YoY: {fmt_pct(x.get('yoy'))}")
+        lines.append(f"· 링크: {x.get('link','')}")
+        return "\n".join(lines)
 
-            # 보유비율 변동(전%→후%(±p.p.))
-            pr = x.get("prev_r")
-            ar = x.get("after_r")
-            dp = x.get("delta_pp")
-            if pr is not None and ar is not None and dp is not None:
-                lines.append(f"  · 보유비율 변동: {fmt_ratio(pr)} → {fmt_ratio(ar)} ({fmt_pp(dp)})")
-            elif pr is not None and ar is not None:
-                lines.append(f"  · 보유비율 변동: {fmt_ratio(pr)} → {fmt_ratio(ar)}")
-            elif dp is not None:
-                lines.append(f"  · 보유비율 변동: {fmt_pp(dp)}")
-            else:
-                lines.append("  · 보유비율 변동: N/A")
+    def build_asset_message(x: Dict) -> str:
+        corp = x["corp"]
+        stock = x.get("stock", "")
+        lines = [f"④ 자산양수도 | {corp}" + (f" ({stock})" if stock else "")]
+        lines.append(f"· 공시: {x.get('report','')}")
+        lines.append(f"· 분류키워드: {x.get('why','')}")
+        lines.append(f"· 링크: {x.get('link','')}")
+        return "\n".join(lines)
 
-            lines.append(f"  · 공시: {x.get('report','')}")
-            lines.append(f"  · 링크: {x.get('link','')}")
-        lines.append("")
+    sent = 0
+    for x in major_hits:
+        tg_send(build_major_message(x), chat_id)
+        sent += 1
+    for x in type2_hits:
+        tg_send(build_type2_message(x), chat_id)
+        sent += 1
+    for x in type3_hits:
+        tg_send(build_type3_message(x), chat_id)
+        sent += 1
+    for x in asset_hits:
+        tg_send(build_asset_message(x), chat_id)
+        sent += 1
 
-    def add_section_type2(title: str, arr: List[Dict]):
-        lines.append(f"== {title} ({len(arr)}건) ==")
-        if not arr:
-            lines.append("- 없음")
-            lines.append("")
-            return
-
-        for x in arr:
-            corp = x["corp"]
-            stock = x.get("stock", "")
-            lines.append(f"- {corp}" + (f" ({stock})" if stock else ""))
-            lines.append(f"  · 공시: {x.get('report','')}")
-            lines.append(f"  · 연매출(연결): 전기 {fmt_money(x.get('prev'))} → 당기 {fmt_money(x.get('this'))}")
-            lines.append(f"  · YoY {fmt_pct(x.get('yoy'))}")
-            lines.append(f"  · 링크: {x.get('link','')}")
-        lines.append("")
-
-    def add_section_type3(title: str, arr: List[Dict]):
-        lines.append(f"== {title} ({len(arr)}건) ==")
-        if not arr:
-            lines.append("- 없음")
-            lines.append("")
-            return
-
-        for x in arr:
-            corp = x["corp"]
-            stock = x.get("stock", "")
-            lines.append(f"- {corp}" + (f" ({stock})" if stock else ""))
-            lines.append(f"  · 공시: {x.get('report','')}")
-            lines.append(
-                f"  · 분기매출(연결): 전분기 {fmt_money(x.get('prev'))} → 이번분기 {fmt_money(x.get('this'))} | 전년동기 {fmt_money(x.get('yoybase'))}"
-            )
-            lines.append(f"  · QoQ {fmt_pct(x.get('qoq'))} | YoY {fmt_pct(x.get('yoy'))}")
-            lines.append(f"  · 링크: {x.get('link','')}")
-        lines.append("")
-
-    add_section_major("① 대량보유(매수/취득/증여/상속/기타사유)", major_hits)
-    add_section_type2("② 손익구조 이상변경 + 연매출 YoY ≥ +15%", type2_hits)
-    add_section_type3("③ 정기보고서(분기/반기/사업) + 매출 QoQ 또는 YoY ≥ +15%", type3_hits)
-
-    tg_send("\n".join(lines).strip(), chat_id)
+    if sent == 0:
+        tg_send(f"KST {today} 기준 필터 통과 공시가 없습니다.", chat_id)
 
 
 if __name__ == "__main__":

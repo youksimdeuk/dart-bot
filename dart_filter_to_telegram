@@ -1,0 +1,675 @@
+# dart_filter_to_telegram.py
+# 목적: OpenDART(전자공시)에서 "당일 접수 공시"를 전수 확인 후,
+# ① 대량보유(장내매수/증여/상속) + 늘어난 주체(보고의무자) + 주식수/보유비율 변동(전/후/증감)
+# ② 손익구조 이상변경(연매출 YoY +15%↑)
+# ③ 정기보고서(분기/반기/사업) (매출 QoQ 또는 YoY +15%↑)
+# 만 필터링하여 매일 18:10(KST) 텔레그램 봇 DM으로 1회 발송.
+#
+# 표시 규칙:
+# - 매출은 "억" 단위로만 표시
+# - 대량보유는:
+#   · 주체(보고의무자) 표시(가능하면)
+#   · 주식수 변동: "전 → 후 (±증감)"
+#   · 보유비율 변동: "전% → 후% (±p.p.)"
+# - 헤더에 "당일 공시 총건수 / 필터 통과 건수" 표시
+
+import os
+import re
+import argparse
+import datetime as dt
+from typing import Optional, Tuple, Dict, List
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DART_API_KEY = os.getenv("DART_API_KEY", "").strip()
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+DART_BASE = "https://opendart.fss.or.kr/api"
+TG_BASE = f"https://api.telegram.org/bot{TG_TOKEN}"
+
+
+# ====== 유틸 ======
+def kst_today_yyyymmdd() -> str:
+    now_utc = dt.datetime.utcnow()
+    now_kst = now_utc + dt.timedelta(hours=9)
+    return now_kst.strftime("%Y%m%d")
+
+
+def resolve_target_yyyymmdd(date_arg: Optional[str], days_ago: int) -> str:
+    if date_arg:
+        if not re.fullmatch(r"\d{8}", date_arg):
+            raise ValueError("--date 형식은 YYYYMMDD여야 합니다.")
+        try:
+            dt.datetime.strptime(date_arg, "%Y%m%d")
+        except ValueError as exc:
+            raise ValueError("--date 값이 유효한 날짜가 아닙니다.") from exc
+        return date_arg
+
+    if days_ago < 0:
+        raise ValueError("--days-ago는 0 이상이어야 합니다.")
+
+    now_kst = dt.datetime.utcnow() + dt.timedelta(hours=9)
+    target = now_kst - dt.timedelta(days=days_ago)
+    return target.strftime("%Y%m%d")
+
+
+def num(x) -> Optional[int]:
+    if x is None:
+        return None
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan", "null", "-"):
+        return None
+    s = s.replace(",", "")
+    if re.match(r"^\(\d+(\.\d+)?\)$", s):
+        s = "-" + s[1:-1]
+    try:
+        return int(round(float(s)))
+    except (TypeError, ValueError):
+        return None
+
+
+def fnum(x) -> Optional[float]:
+    if x is None:
+        return None
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan", "null", "-"):
+        return None
+    s = s.replace(",", "")
+    if re.match(r"^\(\d+(\.\d+)?\)$", s):
+        s = "-" + s[1:-1]
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def pct(a: Optional[int], b: Optional[int]) -> Optional[float]:
+    if a is None or b is None or b == 0:
+        return None
+    return (a / b) - 1.0
+
+
+def fmt_money(v: Optional[int]) -> str:
+    """매출 표시: 억 단위만"""
+    if v is None:
+        return "N/A"
+    eok = int(round(v / 1e8))
+    return f"{eok:,}억"
+
+
+def fmt_pct(p: Optional[float]) -> str:
+    if p is None:
+        return "N/A"
+    return f"{p*100:+.1f}%"
+
+
+def fmt_shares(v: Optional[int]) -> str:
+    if v is None:
+        return "N/A"
+    return f"{v:,}주"
+
+
+def fmt_ratio(v: Optional[float]) -> str:
+    if v is None:
+        return "N/A"
+    return f"{v:.2f}%"
+
+
+def fmt_pp(v: Optional[float]) -> str:
+    if v is None:
+        return "N/A"
+    sign = "+" if v > 0 else ""
+    return f"{sign}{v:.2f}p.p."
+
+
+def dart_view_url(rcp_no: str) -> str:
+    return f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcp_no}"
+
+
+# ====== 텔레그램 ======
+def tg_get_chat_id_auto() -> Optional[str]:
+    """
+    봇에게 /start를 보낸 이후 getUpdates에서 가장 최근 사용자 chat_id를 찾음.
+    운영 안정성을 위해서는 TELEGRAM_CHAT_ID를 .env에 고정 추천.
+    """
+    try:
+        r = requests.get(f"{TG_BASE}/getUpdates", timeout=15)
+        data = r.json()
+        if not data.get("ok"):
+            return None
+        updates = data.get("result", [])
+        for upd in reversed(updates):
+            msg = upd.get("message") or upd.get("edited_message")
+            if msg and msg.get("chat") and msg["chat"].get("id"):
+                return str(msg["chat"]["id"])
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        return None
+    return None
+
+
+def tg_send(text: str, chat_id: str) -> None:
+    MAX = 3500
+    chunks = [text[i:i + MAX] for i in range(0, len(text), MAX)] or [""]
+    for chunk in chunks:
+        payload = {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True}
+        resp = requests.post(f"{TG_BASE}/sendMessage", data=payload, timeout=20)
+        if resp.status_code != 200:
+            raise RuntimeError(f"텔레그램 전송 실패(status={resp.status_code}): {resp.text[:200]}")
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise RuntimeError(f"텔레그램 응답 파싱 실패: {resp.text[:200]}") from exc
+        if not data.get("ok"):
+            raise RuntimeError(f"텔레그램 API 오류: {data}")
+
+
+# ====== OpenDART 호출 ======
+def dart_list(bgn_de: str, end_de: str) -> List[Dict]:
+    """당일 공시 목록(list.json). 페이지네이션 처리."""
+    params = {
+        "crtfc_key": DART_API_KEY,
+        "bgn_de": bgn_de,
+        "end_de": end_de,
+        "page_no": 1,
+        "page_count": 100,
+    }
+    out: List[Dict] = []
+    while True:
+        r = requests.get(f"{DART_BASE}/list.json", params=params, timeout=20)
+        data = r.json()
+        if data.get("status") != "000":
+            break
+        out.extend(data.get("list", []))
+        total_page = int(data.get("total_page", 1))
+        if int(params["page_no"]) >= total_page:
+            break
+        params["page_no"] = int(params["page_no"]) + 1
+    return out
+
+
+def dart_majorstock_item(corp_code: str, rcept_no: str) -> Dict:
+    """majorstock.json에서 rcept_no에 해당하는 1개 항목(dict) 반환(없으면 빈 dict)."""
+    params = {"crtfc_key": DART_API_KEY, "corp_code": corp_code}
+    r = requests.get(f"{DART_BASE}/majorstock.json", params=params, timeout=20)
+    data = r.json()
+    if data.get("status") != "000":
+        return {}
+    items = data.get("list", [])
+    candidates = [it for it in items if str(it.get("rcept_no", "")) == str(rcept_no)]
+    if candidates:
+        return candidates[0]
+    return {}
+
+
+def dart_majorstock_actor(corp_code: str, rcept_no: str, item: Optional[Dict] = None) -> str:
+    """
+    대량보유에서 '늘어난 주체'를 DM에 보여주기 위해:
+    - 우선순위: 보고의무자/보고자(Reporting person/entity) 성격 필드
+    - 필드명이 케이스별로 달라 후보 키를 폭넓게 탐색
+    """
+    it = item if item is not None else dart_majorstock_item(corp_code, rcept_no)
+    if not it:
+        return ""
+
+    # 1) 후보 키 우선 탐색
+    key_candidates = [
+        "rpt_psn", "rpt_nm", "rpt_name", "reporter", "reporter_nm", "reporter_name",
+        "repr_nm", "repr_name", "nm", "name"
+    ]
+
+    def clean(s: str) -> str:
+        return re.sub(r"\s+", " ", s).strip()
+
+    # 명시적 키 우선
+    for k in key_candidates:
+        if k in it and isinstance(it.get(k), str) and clean(it.get(k)) not in ("", "-", "N/A"):
+            return clean(it.get(k))
+
+    # 2) 키 이름 휴리스틱(보고/의무/자/인 이름 계열)
+    for k, v in it.items():
+        if not isinstance(v, str):
+            continue
+        lk = str(k).lower()
+        if any(t in lk for t in ["rpt", "report", "oblig", "duty", "psn", "person", "nm", "name"]) and "rcept" not in lk:
+            vv = clean(v)
+            if vv and vv not in ("-", "N/A"):
+                return vv
+
+    return ""
+
+
+def dart_majorstock_reason(corp_code: str, rcept_no: str, item: Optional[Dict] = None) -> str:
+    it = item if item is not None else dart_majorstock_item(corp_code, rcept_no)
+    if not it:
+        return ""
+    parts: List[str] = []
+    for k, v in it.items():
+        if isinstance(v, str) and v.strip():
+            if any(x in str(k).lower() for x in ["resn", "reason", "rm", "note", "change", "report"]):
+                parts.append(v.strip())
+    if not parts:
+        for v in it.values():
+            if isinstance(v, str) and v.strip():
+                parts.append(v.strip())
+    return " | ".join(parts)
+
+
+def dart_majorstock_changes(
+    corp_code: str, rcept_no: str, item: Optional[Dict] = None
+) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[float], Optional[float], Optional[float]]:
+    """
+    대량보유 상세에서
+    - 주식수: (delta_shares, prev_shares, after_shares)
+    - 보유비율(%): (delta_pp, prev_ratio, after_ratio)
+    """
+    it = item if item is not None else dart_majorstock_item(corp_code, rcept_no)
+    if not it:
+        return (None, None, None, None, None, None)
+
+    delta_keys = ["chg_stock_qty", "chg_stk_qty", "change_stock_qty", "stock_qty_chg", "delta_stock", "delta_qty"]
+    prev_keys = ["bfhold_stock_qty", "before_hold_stock_qty", "prev_hold_stock_qty", "hold_stock_qty_bf", "bf_stock_qty"]
+    after_keys = ["afhold_stock_qty", "after_hold_stock_qty", "hold_stock_qty_af", "af_stock_qty", "hold_stock_qty"]
+
+    prev_r_keys = ["bfhold_stock_rt", "bfhold_stock_rate", "before_hold_ratio", "before_hold_rate", "hold_stock_rt_bf", "bf_ratio", "bf_rate"]
+    after_r_keys = ["afhold_stock_rt", "afhold_stock_rate", "after_hold_ratio", "after_hold_rate", "hold_stock_rt_af", "af_ratio", "af_rate", "hold_stock_rt", "hold_stock_rate"]
+    delta_r_keys = ["chg_hold_stock_rt", "chg_hold_stock_rate", "chg_ratio", "chg_rate", "delta_ratio", "delta_rate"]
+
+    def pick_int(keys: List[str]) -> Optional[int]:
+        for k in keys:
+            if k in it:
+                v = num(it.get(k))
+                if v is not None:
+                    return v
+        return None
+
+    def pick_float(keys: List[str]) -> Optional[float]:
+        for k in keys:
+            if k in it:
+                v = fnum(it.get(k))
+                if v is not None:
+                    return v
+        return None
+
+    delta = pick_int(delta_keys)
+    prev_ = pick_int(prev_keys)
+    after = pick_int(after_keys)
+
+    if delta is None and prev_ is not None and after is not None:
+        delta = after - prev_
+
+    prev_r = pick_float(prev_r_keys)
+    after_r = pick_float(after_r_keys)
+    delta_r = pick_float(delta_r_keys)
+
+    if delta_r is None and prev_r is not None and after_r is not None:
+        delta_r = after_r - prev_r
+
+    return (delta, prev_, after, delta_r, prev_r, after_r)
+
+
+def dart_get_cum_sales(corp_code: str, year: int, reprt_code: str) -> Optional[int]:
+    """연결(CFS) 기준 손익(IS/CIS) 매출액(thstrm_amount) 반환."""
+    params = {
+        "crtfc_key": DART_API_KEY,
+        "corp_code": corp_code,
+        "bsns_year": str(year),
+        "reprt_code": reprt_code,
+        "fs_div": "CFS",
+    }
+    r = requests.get(f"{DART_BASE}/fnlttSinglAcntAll.json", params=params, timeout=25)
+    data = r.json()
+    if data.get("status") != "000":
+        return None
+
+    rows = data.get("list", [])
+    is_rows = [x for x in rows if str(x.get("sj_div", "")).upper() in ("IS", "CIS")]
+    if not is_rows:
+        is_rows = rows
+
+    priority = [x for x in is_rows if str(x.get("account_id", "")).strip() == "ifrs-full_Revenue"]
+    candidates = priority if priority else is_rows
+
+    for x in candidates:
+        anm = str(x.get("account_nm", "")).strip()
+        if anm == "매출액":
+            return num(x.get("thstrm_amount"))
+
+    for x in candidates:
+        anm = str(x.get("account_nm", "")).strip()
+        if ("매출" in anm) and ("매출원가" not in anm) and ("매출총" not in anm) and ("총이익" not in anm):
+            return num(x.get("thstrm_amount"))
+
+    return None
+
+
+def quarter_index_from_reprt(reprt_code: str) -> int:
+    return {"11013": 1, "11012": 2, "11014": 3, "11011": 4}.get(reprt_code, 0)
+
+
+def derive_quarter_sales(corp_code: str, year: int, q: int) -> Optional[int]:
+    if q == 1:
+        return dart_get_cum_sales(corp_code, year, "11013")
+    if q == 2:
+        h1 = dart_get_cum_sales(corp_code, year, "11012")
+        q1 = dart_get_cum_sales(corp_code, year, "11013")
+        if h1 is None or q1 is None:
+            return None
+        return h1 - q1
+    if q == 3:
+        q3cum = dart_get_cum_sales(corp_code, year, "11014")
+        h1 = dart_get_cum_sales(corp_code, year, "11012")
+        if q3cum is None or h1 is None:
+            return None
+        return q3cum - h1
+    if q == 4:
+        fy = dart_get_cum_sales(corp_code, year, "11011")
+        q3cum = dart_get_cum_sales(corp_code, year, "11014")
+        if fy is None or q3cum is None:
+            return None
+        return fy - q3cum
+    return None
+
+
+def compute_sales_metrics(corp_code: str, year: int, reprt_code: str) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[float], Optional[float]]:
+    q = quarter_index_from_reprt(reprt_code)
+    if q == 0:
+        return (None, None, None, None, None)
+
+    this_sales = derive_quarter_sales(corp_code, year, q)
+
+    if q == 1:
+        prev_sales = derive_quarter_sales(corp_code, year - 1, 4)
+    else:
+        prev_sales = derive_quarter_sales(corp_code, year, q - 1)
+
+    yoy_sales = derive_quarter_sales(corp_code, year - 1, q)
+
+    qoq_p = pct(this_sales, prev_sales)
+    yoy_p = pct(this_sales, yoy_sales)
+    return (this_sales, prev_sales, yoy_sales, qoq_p, yoy_p)
+
+
+def compute_annual_sales_yoy(corp_code: str, year: int) -> Tuple[Optional[int], Optional[int], Optional[float]]:
+    this_sales = dart_get_cum_sales(corp_code, year, "11011")
+    prev_sales = dart_get_cum_sales(corp_code, year - 1, "11011")
+    yoy_p = pct(this_sales, prev_sales)
+    return this_sales, prev_sales, yoy_p
+
+
+def reprt_code_from_report_nm(report_nm: str) -> Optional[str]:
+    nm = report_nm.replace(" ", "")
+    period_year, period_month = extract_report_period(report_nm)
+    if "분기보고서" in nm:
+        if period_month == 3:
+            return "11013"
+        if period_month == 9:
+            return "11014"
+        if "1분기" in nm:
+            return "11013"
+        if "3분기" in nm:
+            return "11014"
+    if "반기보고서" in nm:
+        return "11012"
+    if "사업보고서" in nm:
+        return "11011"
+    return None
+
+
+def extract_report_period(report_nm: str) -> Tuple[Optional[int], Optional[int]]:
+    nm = report_nm.replace(" ", "")
+    m = re.search(r"\((\d{4})\.(\d{2})\)", nm)
+    if not m:
+        return None, None
+    return int(m.group(1)), int(m.group(2))
+
+
+def business_year_from_report(report_nm: str, rcept_dt: str, today: str) -> int:
+    period_year, _ = extract_report_period(report_nm)
+    if period_year is not None:
+        return period_year
+
+    if len(rcept_dt) >= 4 and rcept_dt[:4].isdigit():
+        base_year = int(rcept_dt[:4])
+    else:
+        base_year = int(today[:4])
+
+    nm = report_nm.replace(" ", "")
+    if "사업보고서" in nm:
+        return base_year - 1
+    return base_year
+
+
+# ====== 필터 ======
+KW_MAJOR = ["장내매수", "장내 매수", "장내매입", "장내 매입", "증여", "상속"]
+
+
+def is_majorstock_target(item: Dict) -> bool:
+    return "주식등의대량보유상황보고서" in str(item.get("report_nm", ""))
+
+
+def majorstock_pass(item: Dict) -> Tuple[bool, str, str, Optional[int], Optional[int], Optional[int], Optional[float], Optional[float], Optional[float]]:
+    corp_code = str(item.get("corp_code", ""))
+    rcept_no = str(item.get("rcept_no", ""))
+    major_item = dart_majorstock_item(corp_code, rcept_no)
+    if not major_item:
+        return (False, "", "", None, None, None, None, None, None)
+
+    reason = dart_majorstock_reason(corp_code, rcept_no, item=major_item)
+    hit = ""
+    for k in KW_MAJOR:
+        if k in reason:
+            hit = k
+            break
+    if hit == "":
+        return (False, "", "", None, None, None, None, None, None)
+
+    actor = dart_majorstock_actor(corp_code, rcept_no, item=major_item)  # 늘어난 주체(보고의무자) 후보
+    delta_sh, prev_sh, after_sh, delta_pp, prev_r, after_r = dart_majorstock_changes(corp_code, rcept_no, item=major_item)
+    return (True, hit, actor, delta_sh, prev_sh, after_sh, delta_pp, prev_r, after_r)
+
+
+def is_profitstructure_change(item: Dict) -> bool:
+    nm = str(item.get("report_nm", ""))
+    return ("매출액또는손익구조" in nm) and ("이상변경" in nm)
+
+
+def is_periodic_report(item: Dict) -> bool:
+    nm = str(item.get("report_nm", ""))
+    return ("분기보고서" in nm) or ("반기보고서" in nm) or ("사업보고서" in nm)
+
+
+# ====== 메인 ======
+def main(target_date: Optional[str] = None):
+    if not DART_API_KEY:
+        raise RuntimeError("DART_API_KEY가 필요합니다.")
+    if not TG_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN가 필요합니다.")
+
+    chat_id = TG_CHAT_ID
+    if not chat_id:
+        chat_id = tg_get_chat_id_auto()
+        if not chat_id:
+            raise RuntimeError(
+                "TELEGRAM_CHAT_ID를 못 찾았습니다.\n"
+                "1) 텔레그램에서 봇에게 DM으로 /start를 보낸 뒤\n"
+                "2) 스크립트를 다시 실행하거나\n"
+                "3) .env에 TELEGRAM_CHAT_ID를 직접 넣어주세요."
+            )
+
+    today = target_date or kst_today_yyyymmdd()
+    items = dart_list(today, today)
+    total_count = len(items)
+
+    major_hits: List[Dict] = []
+    type2_hits: List[Dict] = []
+    type3_hits: List[Dict] = []
+
+    for it in items:
+        corp = str(it.get("corp_name", "")).strip()
+        stock = str(it.get("stock_code", "")).strip()
+        report_nm = str(it.get("report_nm", "")).strip()
+        rcept_no = str(it.get("rcept_no", "")).strip()
+        rcept_dt = str(it.get("rcept_dt", "")).strip()
+        year = business_year_from_report(report_nm, rcept_dt, today)
+        link = dart_view_url(rcept_no)
+
+        # (1) 대량보유
+        if is_majorstock_target(it):
+            ok, why, actor, delta_sh, prev_sh, after_sh, delta_pp, prev_r, after_r = majorstock_pass(it)
+            if ok:
+                major_hits.append({
+                    "corp": corp, "stock": stock, "report": report_nm,
+                    "why": why, "actor": actor, "date": rcept_dt, "link": link,
+                    "delta_sh": delta_sh, "prev_sh": prev_sh, "after_sh": after_sh,
+                    "delta_pp": delta_pp, "prev_r": prev_r, "after_r": after_r
+                })
+            continue
+
+        # (2) 손익구조 이상변경: 연매출 YoY +15% 이상
+        if is_profitstructure_change(it):
+            corp_code = str(it.get("corp_code", "")).strip()
+            this_sales, prev_sales, yoy_p = compute_annual_sales_yoy(corp_code, year)
+            if yoy_p is not None and yoy_p >= 0.15:
+                type2_hits.append({
+                    "corp": corp, "stock": stock, "report": report_nm,
+                    "date": rcept_dt, "link": link,
+                    "this": this_sales, "prev": prev_sales, "yoy": yoy_p
+                })
+            continue
+
+        # (3) 정기보고서: QoQ 또는 YoY +15% 이상
+        if is_periodic_report(it):
+            reprt = reprt_code_from_report_nm(report_nm)
+            if not reprt:
+                continue
+            corp_code = str(it.get("corp_code", "")).strip()
+            this_sales, prev_sales, yoy_sales, qoq_p, yoy_p = compute_sales_metrics(corp_code, year, reprt)
+            pass_flag = ((qoq_p is not None and qoq_p >= 0.15) or (yoy_p is not None and yoy_p >= 0.15))
+            if pass_flag:
+                type3_hits.append({
+                    "corp": corp, "stock": stock, "report": report_nm,
+                    "date": rcept_dt, "link": link,
+                    "this": this_sales, "prev": prev_sales, "yoybase": yoy_sales,
+                    "qoq": qoq_p, "yoy": yoy_p
+                })
+
+    passed_count = len(major_hits) + len(type2_hits) + len(type3_hits)
+
+    # ===== 메시지 구성 =====
+    lines: List[str] = []
+    lines.append(f"📌 DART 필터 리포트 (KST {today})")
+    lines.append(f"총 공시 {total_count}건 | 필터 통과 {passed_count}건")
+    lines.append("")
+
+    def add_section_major(title: str, arr: List[Dict]):
+        lines.append(f"== {title} ({len(arr)}건) ==")
+        if not arr:
+            lines.append("- 없음")
+            lines.append("")
+            return
+
+        for x in arr:
+            corp = x["corp"]
+            stock = x.get("stock", "")
+            lines.append(f"- {corp}" + (f" ({stock})" if stock else ""))
+
+            # 늘어난 주체(보고의무자)
+            actor = (x.get("actor") or "").strip()
+            lines.append(f"  · 주체(보고의무자): {actor if actor else 'N/A'}")
+
+            lines.append(f"  · 사유: {x.get('why','')}")
+
+            # 주식수 변동(전→후(±))
+            ps = x.get("prev_sh")
+            af = x.get("after_sh")
+            ds = x.get("delta_sh")
+            if ps is not None and af is not None and ds is not None:
+                sign = "+" if ds > 0 else ""
+                lines.append(f"  · 주식수 변동: {fmt_shares(ps)} → {fmt_shares(af)} ({sign}{fmt_shares(ds)})")
+            elif ds is not None:
+                sign = "+" if ds > 0 else ""
+                lines.append(f"  · 주식수 변동: {sign}{fmt_shares(ds)}")
+            else:
+                lines.append("  · 주식수 변동: N/A")
+
+            # 보유비율 변동(전%→후%(±p.p.))
+            pr = x.get("prev_r")
+            ar = x.get("after_r")
+            dp = x.get("delta_pp")
+            if pr is not None and ar is not None and dp is not None:
+                lines.append(f"  · 보유비율 변동: {fmt_ratio(pr)} → {fmt_ratio(ar)} ({fmt_pp(dp)})")
+            elif pr is not None and ar is not None:
+                lines.append(f"  · 보유비율 변동: {fmt_ratio(pr)} → {fmt_ratio(ar)}")
+            elif dp is not None:
+                lines.append(f"  · 보유비율 변동: {fmt_pp(dp)}")
+            else:
+                lines.append("  · 보유비율 변동: N/A")
+
+            lines.append(f"  · 공시: {x.get('report','')}")
+            lines.append(f"  · 링크: {x.get('link','')}")
+        lines.append("")
+
+    def add_section_type2(title: str, arr: List[Dict]):
+        lines.append(f"== {title} ({len(arr)}건) ==")
+        if not arr:
+            lines.append("- 없음")
+            lines.append("")
+            return
+
+        for x in arr:
+            corp = x["corp"]
+            stock = x.get("stock", "")
+            lines.append(f"- {corp}" + (f" ({stock})" if stock else ""))
+            lines.append(f"  · 공시: {x.get('report','')}")
+            lines.append(f"  · 연매출(연결): 전기 {fmt_money(x.get('prev'))} → 당기 {fmt_money(x.get('this'))}")
+            lines.append(f"  · YoY {fmt_pct(x.get('yoy'))}")
+            lines.append(f"  · 링크: {x.get('link','')}")
+        lines.append("")
+
+    def add_section_type3(title: str, arr: List[Dict]):
+        lines.append(f"== {title} ({len(arr)}건) ==")
+        if not arr:
+            lines.append("- 없음")
+            lines.append("")
+            return
+
+        for x in arr:
+            corp = x["corp"]
+            stock = x.get("stock", "")
+            lines.append(f"- {corp}" + (f" ({stock})" if stock else ""))
+            lines.append(f"  · 공시: {x.get('report','')}")
+            lines.append(
+                f"  · 분기매출(연결): 전분기 {fmt_money(x.get('prev'))} → 이번분기 {fmt_money(x.get('this'))} | 전년동기 {fmt_money(x.get('yoybase'))}"
+            )
+            lines.append(f"  · QoQ {fmt_pct(x.get('qoq'))} | YoY {fmt_pct(x.get('yoy'))}")
+            lines.append(f"  · 링크: {x.get('link','')}")
+        lines.append("")
+
+    add_section_major("① 대량보유(장내매수/증여/상속)", major_hits)
+    add_section_type2("② 손익구조 이상변경 + 연매출 YoY ≥ +15%", type2_hits)
+    add_section_type3("③ 정기보고서(분기/반기/사업) + 매출 QoQ 또는 YoY ≥ +15%", type3_hits)
+
+    tg_send("\n".join(lines).strip(), chat_id)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="DART 공시 필터 텔레그램 발송")
+    parser.add_argument("--date", help="조회 기준일(KST) YYYYMMDD")
+    parser.add_argument(
+        "--days-ago",
+        type=int,
+        default=0,
+        help="오늘(KST) 기준 며칠 전을 조회할지 지정 (기본값: 0)",
+    )
+    args = parser.parse_args()
+
+    try:
+        target_date = resolve_target_yyyymmdd(args.date, args.days_ago)
+    except ValueError as exc:
+        raise SystemExit(f"입력 오류: {exc}")
+
+    main(target_date=target_date)

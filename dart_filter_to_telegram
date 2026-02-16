@@ -31,12 +31,12 @@ TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 DART_BASE = "https://opendart.fss.or.kr/api"
 TG_BASE = f"https://api.telegram.org/bot{TG_TOKEN}"
+KST = dt.timezone(dt.timedelta(hours=9))
 
 
 # ====== 유틸 ======
 def kst_today_yyyymmdd() -> str:
-    now_utc = dt.datetime.utcnow()
-    now_kst = now_utc + dt.timedelta(hours=9)
+    now_kst = dt.datetime.now(tz=KST)
     return now_kst.strftime("%Y%m%d")
 
 
@@ -53,7 +53,7 @@ def resolve_target_yyyymmdd(date_arg: Optional[str], days_ago: int) -> str:
     if days_ago < 0:
         raise ValueError("--days-ago는 0 이상이어야 합니다.")
 
-    now_kst = dt.datetime.utcnow() + dt.timedelta(hours=9)
+    now_kst = dt.datetime.now(tz=KST)
     target = now_kst - dt.timedelta(days=days_ago)
     return target.strftime("%Y%m%d")
 
@@ -610,6 +610,9 @@ def main(target_date: Optional[str] = None):
         if is_profitstructure_change(it):
             corp_code = str(it.get("corp_code", "")).strip()
             this_sales, prev_sales, yoy_p = compute_annual_sales_yoy(corp_code, year)
+            if yoy_p is None and year > 1:
+                # 일부 공시는 접수연도 기준 직전 사업연도 실적을 대상으로 하는 경우가 있어 fallback 적용
+                this_sales, prev_sales, yoy_p = compute_annual_sales_yoy(corp_code, year - 1)
             if yoy_p is not None and yoy_p >= 0.15:
                 type2_hits.append({
                     "corp": corp, "stock": stock, "report": report_nm,

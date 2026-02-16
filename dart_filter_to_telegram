@@ -489,11 +489,12 @@ KW_MAJOR = [
     "매수", "취득", "신주 취득", "유상증자 참여",
     "증여", "상속",
 ]
-KW_MAJOR_EXCLUDE = ["장내매도", "장내 매도", "매도", "처분", "양도"]
+KW_MAJOR_EXCLUDE = ["장내매도", "장내 매도", "매도", "처분"]
 
 
 def is_majorstock_target(item: Dict) -> bool:
-    return "주식등의대량보유상황보고서" in str(item.get("report_nm", ""))
+    nm = re.sub(r"[^\w]", "", str(item.get("report_nm", "")))
+    return "임원주요주주특정증권등소유상황보고서" in nm
 
 
 def majorstock_pass(
@@ -522,10 +523,7 @@ def majorstock_pass(
             hit = k
             break
     if hit == "":
-        if reason.strip():
-            hit = "기타사유"
-        else:
-            return (False, "", "", "", None, None, None, None, None, None)
+        return (False, "", "", "", None, None, None, None, None, None)
 
     actor = dart_majorstock_actor(corp_code, rcept_no, item=major_item)  # 늘어난 주체(보고의무자) 후보
     delta_sh, prev_sh, after_sh, delta_pp, prev_r, after_r = dart_majorstock_changes(corp_code, rcept_no, item=major_item)

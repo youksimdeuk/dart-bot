@@ -206,6 +206,57 @@ def dart_majorstock_item(corp_code: str, rcept_no: str) -> Dict:
     return {}
 
 
+def dart_elestock_item(corp_code: str, rcept_no: str) -> Dict:
+    """elestock.json에서 rcept_no에 해당하는 1개 항목(dict) 반환(없으면 빈 dict)."""
+    params = {"crtfc_key": DART_API_KEY, "corp_code": corp_code}
+    r = requests.get(f"{DART_BASE}/elestock.json", params=params, timeout=20)
+    data = r.json()
+    if data.get("status") != "000":
+        return {}
+    items = data.get("list", [])
+    candidates = [it for it in items if str(it.get("rcept_no", "")) == str(rcept_no)]
+    if candidates:
+        return candidates[0]
+    return {}
+
+
+def dart_elestock_actor(item: Dict) -> str:
+    actor = str(item.get("repror", "")).strip()
+    return actor if actor else ""
+
+
+def dart_elestock_changes(
+    item: Dict,
+) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[float], Optional[float], Optional[float]]:
+    after_sh = num(item.get("sp_stock_lmp_cnt"))
+    delta_sh = num(item.get("sp_stock_lmp_irds_cnt"))
+    prev_sh = None
+    if after_sh is not None and delta_sh is not None:
+        prev_sh = after_sh - delta_sh
+
+    after_r = fnum(item.get("sp_stock_lmp_rate"))
+    delta_pp = fnum(item.get("sp_stock_lmp_irds_rate"))
+    prev_r = None
+    if after_r is not None and delta_pp is not None:
+        prev_r = after_r - delta_pp
+
+    return (delta_sh, prev_sh, after_sh, delta_pp, prev_r, after_r)
+
+
+def dart_elestock_reason(item: Dict) -> str:
+    parts: List[str] = []
+    ofcps = str(item.get("isu_exctv_ofcps", "")).strip()
+    if ofcps:
+        parts.append(f"직위: {ofcps}")
+    exctv = str(item.get("isu_exctv_rgist_at", "")).strip()
+    if exctv:
+        parts.append(f"임원등록: {exctv}")
+    main_shr = str(item.get("isu_main_shrholdr", "")).strip()
+    if main_shr:
+        parts.append(f"주요주주: {main_shr}")
+    return " | ".join(parts)
+
+
 def dart_majorstock_actor(corp_code: str, rcept_no: str, item: Optional[Dict] = None) -> str:
     """
     대량보유에서 '늘어난 주체'를 DM에 보여주기 위해:
@@ -493,8 +544,8 @@ KW_MAJOR_EXCLUDE = ["장내매도", "장내 매도", "매도", "처분"]
 
 
 def is_majorstock_target(item: Dict) -> bool:
-    nm = re.sub(r"[^\w]", "", str(item.get("report_nm", "")))
-    return "임원주요주주특정증권등소유상황보고서" in nm
+    nm = str(item.get("report_nm", "")).replace(" ", "")
+    return ("임원ㆍ주요주주특정증권등소유상황보고서" in nm) or ("임원주요주주특정증권등소유상황보고서" in nm)
 
 
 def majorstock_pass(
@@ -506,6 +557,29 @@ def majorstock_pass(
 ]:
     corp_code = str(item.get("corp_code", ""))
     rcept_no = str(item.get("rcept_no", ""))
+
+    # 임원ㆍ주요주주 특정증권 소유상황은 elestock.json이 원천 데이터
+    elestock_item = dart_elestock_item(corp_code, rcept_no)
+    if elestock_item:
+        actor = dart_elestock_actor(elestock_item)
+        delta_sh, prev_sh, after_sh, delta_pp, prev_r, after_r = dart_elestock_changes(elestock_item)
+        reason = dart_elestock_reason(elestock_item)
+
+        is_increase = (
+            (delta_sh is not None and delta_sh > 0)
+            or (delta_pp is not None and delta_pp > 0)
+        )
+        if not is_increase:
+            return (False, "", "", "", None, None, None, None, None, None)
+
+        if delta_sh is not None and delta_sh > 0:
+            why = "보유주식수 증가"
+        else:
+            why = "보유비율 증가"
+
+        return (True, why, reason, actor, delta_sh, prev_sh, after_sh, delta_pp, prev_r, after_r)
+
+    # fallback: majorstock.json
     major_item = dart_majorstock_item(corp_code, rcept_no)
     if not major_item:
         return (False, "", "", "", None, None, None, None, None, None)

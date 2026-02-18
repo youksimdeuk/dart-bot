@@ -742,7 +742,7 @@ def main(target_date: Optional[str] = None):
         ar = x.get("after_r")
         dp = x.get("delta_pp")
 
-        lines = [f"① 대량보유 | {corp}" + (f" ({stock})" if stock else "")]
+        lines = [f"① 임원/주요주주 | {corp}" + (f" ({stock})" if stock else "")]
         lines.append(f"· 주체(보고의무자): {actor if actor else 'N/A'}")
         lines.append(f"· 사유분류: {x.get('why','')}")
         lines.append(f"· 상세사유: {x.get('reason_text','') or 'N/A'}")

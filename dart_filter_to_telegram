@@ -21,6 +21,7 @@ from functools import lru_cache
 from typing import Optional, Tuple, Dict, List
 
 import requests
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -396,8 +397,37 @@ def _dart_get_cum_sales_by_fs(corp_code: str, year: int, reprt_code: str, fs_div
         "reprt_code": reprt_code,
         "fs_div": fs_div,
     }
-    r = requests.get(f"{DART_BASE}/fnlttSinglAcntAll.json", params=params, timeout=25)
+
+    r = None
+
+    for attempt in range(1, 4):
+        try:
+            r = requests.get(
+                f"{DART_BASE}/fnlttSinglAcntAll.json",
+                params=params,
+                timeout=35
+            )
+            r.raise_for_status()
+            break
+
+        except requests.exceptions.RequestException as e:
+            print(
+                f"[WARN] DART API 호출 실패 {attempt}/3: "
+                f"corp_code={corp_code}, year={year}, reprt_code={reprt_code}, "
+                f"fs_div={fs_div}, error={e}"
+            )
+
+            if attempt == 3:
+                print(
+                    f"[ERROR] DART API 3회 실패로 해당 재무데이터 스킵: "
+                    f"corp_code={corp_code}, year={year}, reprt_code={reprt_code}, fs_div={fs_div}"
+                )
+                return None
+
+            time.sleep(2 * attempt)
+
     data = r.json()
+
     if data.get("status") != "000":
         return None
 

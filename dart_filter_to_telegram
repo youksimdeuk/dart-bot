@@ -1,6 +1,11 @@
 # dart_filter_to_telegram.py
 # 목적: OpenDART(전자공시)에서 "당일 접수 공시"를 전수 확인 후,
-# ① 대량보유(장내매수/증여/상속) + 늘어난 주체(보고의무자) + 주식수/보유비율 변동(전/후/증감)
+# ① 임원·주요주주 매수 (elestock 기반) — 신호강도 ★★★/★★/★ 분류
+#    - 패시브펀드/연기금/ETF 운용사는 자동으로 ★(약신호)로 강등 (passive_funds.json)
+#    - ★★★: 대표이사/CEO/회장/사장 매수 OR 거래금액 ₩1억+
+#    - ★★ : 거래금액 ₩3천만~1억
+#    - ★  : 그 외 모든 증가 거래
+#    - 거래금액 = 변동주식수 × 보고일 종가 (yfinance)
 # ② 손익구조 이상변경(연매출 YoY +15%↑)
 # ③ 정기보고서(분기/반기/사업) (매출 QoQ 또는 YoY +15%↑)
 # 만 필터링하여 매일 18:10(KST) 텔레그램 봇 DM으로 1회 발송.
@@ -15,16 +20,145 @@
 
 import os
 import re
+import sys
+import json
 import argparse
 import datetime as dt
 from functools import lru_cache
+from pathlib import Path
 from typing import Optional, Tuple, Dict, List
 
 import requests
 import time
 from dotenv import load_dotenv
 
+# Windows cp949 콘솔에서 이모지/한자 출력 시 UnicodeEncodeError 방지
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
 load_dotenv()
+
+
+# ====== 신호강도 분류 (★★★/★★/★) ======
+_PASSIVE_KEYWORDS: Optional[List[str]] = None
+
+
+def _load_passive_keywords() -> List[str]:
+    global _PASSIVE_KEYWORDS
+    if _PASSIVE_KEYWORDS is None:
+        path = Path(__file__).resolve().parent / "passive_funds.json"
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                raw = data.get("passive_keywords", []) or []
+                _PASSIVE_KEYWORDS = [_normalize_actor(k) for k in raw if k]
+            except (json.JSONDecodeError, OSError):
+                _PASSIVE_KEYWORDS = []
+        else:
+            _PASSIVE_KEYWORDS = []
+    return _PASSIVE_KEYWORDS
+
+
+def _normalize_actor(s: str) -> str:
+    if not s:
+        return ""
+    return (
+        s.replace(" ", "")
+        .replace("(주)", "")
+        .replace("(株)", "")
+        .replace("주식회사", "")
+        .replace("(", "")
+        .replace(")", "")
+        .lower()
+    )
+
+
+def is_passive_actor(actor: str) -> bool:
+    norm = _normalize_actor(actor)
+    if not norm:
+        return False
+    for kw in _load_passive_keywords():
+        if kw and kw in norm:
+            return True
+    return False
+
+
+_TOP_EXECUTIVE_KW = ["대표이사", "회장", "부회장", "사장", "CEO", "CFO", "재무이사", "최고경영자"]
+
+
+def classify_executive_rank(reason: str) -> str:
+    """elestock reason 문자열에서 직위 추출. 'top'/'exec'/'shareholder'."""
+    if not reason:
+        return "shareholder"
+    for kw in _TOP_EXECUTIVE_KW:
+        if kw in reason:
+            return "top"
+    if any(k in reason for k in ["임원등록: 등록", "이사", "감사", "임원"]):
+        return "exec"
+    return "shareholder"
+
+
+@lru_cache(maxsize=2048)
+def get_close_price(stock_code: str, corp_cls: str, date_yyyymmdd: str) -> Optional[float]:
+    """yfinance에서 보고일 종가 조회. 휴장일이면 이후 5거래일 내 첫 종가."""
+    if not stock_code or len(stock_code) < 6:
+        return None
+    suffix = ".KS" if corp_cls == "Y" else (".KQ" if corp_cls == "K" else ".KS")
+    ticker = f"{stock_code}{suffix}"
+    try:
+        import yfinance as yf
+        d = dt.datetime.strptime(date_yyyymmdd, "%Y%m%d")
+        start = d.strftime("%Y-%m-%d")
+        end = (d + dt.timedelta(days=7)).strftime("%Y-%m-%d")
+        df = yf.Ticker(ticker).history(start=start, end=end)
+        if df.empty:
+            return None
+        return float(df["Close"].iloc[0])
+    except (ImportError, ValueError, KeyError, IndexError, requests.RequestException):
+        return None
+
+
+def classify_signal_strength(
+    actor: str,
+    reason: str,
+    delta_sh: Optional[int],
+    close_price: Optional[float],
+) -> Tuple[str, Optional[int]]:
+    """
+    반환: (강도, 거래금액원화)
+    - 패시브펀드 → ★
+    - 대표이사·CEO·회장·사장 → ★★★
+    - 거래금액 ₩1억+ → ★★★, ₩3천만~1억 → ★★
+    - 그 외 → ★
+    """
+    if is_passive_actor(actor):
+        return ("★", None)
+
+    rank = classify_executive_rank(reason)
+    amount: Optional[int] = None
+    if delta_sh and close_price and delta_sh > 0:
+        amount = int(delta_sh * close_price)
+
+    if rank == "top":
+        return ("★★★", amount)
+
+    if amount is not None:
+        if amount >= 100_000_000:
+            return ("★★★", amount)
+        if amount >= 30_000_000:
+            return ("★★", amount)
+
+    return ("★", amount)
+
+
+def fmt_won(v: Optional[int]) -> str:
+    if v is None:
+        return ""
+    if v >= 100_000_000:
+        return f"≈ ₩{v / 100_000_000:.1f}억"
+    if v >= 10_000_000:
+        return f"≈ ₩{v / 10_000_000:.1f}천만"
+    return f"≈ ₩{v:,}"
 
 DART_API_KEY = os.getenv("DART_API_KEY", "").strip()
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -663,22 +797,31 @@ def is_asset_transfer_report(item: Dict) -> Tuple[bool, str]:
 
 
 # ====== 메인 ======
-def main(target_date: Optional[str] = None):
+def main(target_date: Optional[str] = None, dry_run: bool = False):
     if not DART_API_KEY:
         raise RuntimeError("DART_API_KEY가 필요합니다.")
-    if not TG_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN가 필요합니다.")
 
-    chat_id = TG_CHAT_ID
-    if not chat_id:
-        chat_id = tg_get_chat_id_auto()
+    chat_id: Optional[str] = None
+    if not dry_run:
+        if not TG_TOKEN:
+            raise RuntimeError("TELEGRAM_BOT_TOKEN가 필요합니다.")
+        chat_id = TG_CHAT_ID
         if not chat_id:
-            raise RuntimeError(
-                "TELEGRAM_CHAT_ID를 못 찾았습니다.\n"
-                "1) 텔레그램에서 봇에게 DM으로 /start를 보낸 뒤\n"
-                "2) 스크립트를 다시 실행하거나\n"
-                "3) .env에 TELEGRAM_CHAT_ID를 직접 넣어주세요."
-            )
+            chat_id = tg_get_chat_id_auto()
+            if not chat_id:
+                raise RuntimeError(
+                    "TELEGRAM_CHAT_ID를 못 찾았습니다.\n"
+                    "1) 텔레그램에서 봇에게 DM으로 /start를 보낸 뒤\n"
+                    "2) 스크립트를 다시 실행하거나\n"
+                    "3) .env에 TELEGRAM_CHAT_ID를 직접 넣어주세요."
+                )
+
+    def _send(text: str) -> None:
+        if dry_run:
+            print("=" * 60)
+            print(text)
+        else:
+            tg_send(text, chat_id)
 
     today = target_date or kst_today_yyyymmdd()
     items = dart_list(today, today)
@@ -702,11 +845,15 @@ def main(target_date: Optional[str] = None):
         if is_majorstock_target(it):
             ok, why, reason_text, actor, delta_sh, prev_sh, after_sh, delta_pp, prev_r, after_r = majorstock_pass(it)
             if ok:
+                corp_cls = str(it.get("corp_cls", "")).strip()
+                close = get_close_price(stock, corp_cls, rcept_dt) if stock else None
+                strength, amount = classify_signal_strength(actor, reason_text, delta_sh, close)
                 major_hits.append({
                     "corp": corp, "stock": stock, "report": report_nm,
                     "why": why, "reason_text": reason_text, "actor": actor, "date": rcept_dt, "link": link,
                     "delta_sh": delta_sh, "prev_sh": prev_sh, "after_sh": after_sh,
-                    "delta_pp": delta_pp, "prev_r": prev_r, "after_r": after_r
+                    "delta_pp": delta_pp, "prev_r": prev_r, "after_r": after_r,
+                    "strength": strength, "amount": amount, "close_price": close,
                 })
             continue
 
@@ -759,7 +906,7 @@ def main(target_date: Optional[str] = None):
         f"총 공시 {total_count}건 | 필터 통과 {passed_count}건\n"
         "발송 방식: 공시 1건당 1메시지"
     )
-    tg_send(summary, chat_id)
+    _send(summary)
 
     def build_major_message(x: Dict) -> str:
         corp = x["corp"]
@@ -772,10 +919,14 @@ def main(target_date: Optional[str] = None):
         ar = x.get("after_r")
         dp = x.get("delta_pp")
 
-        lines = [f"① 임원/주요주주 | {corp}" + (f" ({stock})" if stock else "")]
+        strength = x.get("strength", "★")
+        amount = x.get("amount")
+        lines = [f"{strength} ① 임원/주요주주 | {corp}" + (f" ({stock})" if stock else "")]
         lines.append(f"· 주체(보고의무자): {actor if actor else 'N/A'}")
         lines.append(f"· 사유분류: {x.get('why','')}")
         lines.append(f"· 상세사유: {x.get('reason_text','') or 'N/A'}")
+        if amount:
+            lines.append(f"· 거래금액: {fmt_won(amount)} (취득×보고일 종가)")
         if ps is not None and af is not None and ds is not None:
             sign = "+" if ds > 0 else ""
             lines.append(f"· 주식수 변동: {fmt_shares(ps)} → {fmt_shares(af)} ({sign}{fmt_shares(ds)})")
@@ -829,20 +980,20 @@ def main(target_date: Optional[str] = None):
 
     sent = 0
     for x in major_hits:
-        tg_send(build_major_message(x), chat_id)
+        _send(build_major_message(x))
         sent += 1
     for x in type2_hits:
-        tg_send(build_type2_message(x), chat_id)
+        _send(build_type2_message(x))
         sent += 1
     for x in type3_hits:
-        tg_send(build_type3_message(x), chat_id)
+        _send(build_type3_message(x))
         sent += 1
     for x in asset_hits:
-        tg_send(build_asset_message(x), chat_id)
+        _send(build_asset_message(x))
         sent += 1
 
     if sent == 0:
-        tg_send(f"KST {today} 기준 필터 통과 공시가 없습니다.", chat_id)
+        _send(f"KST {today} 기준 필터 통과 공시가 없습니다.")
 
 
 if __name__ == "__main__":
@@ -854,6 +1005,11 @@ if __name__ == "__main__":
         default=0,
         help="오늘(KST) 기준 며칠 전을 조회할지 지정 (기본값: 0)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="텔레그램 전송 없이 콘솔로만 출력 (로컬 테스트용)",
+    )
     args = parser.parse_args()
 
     try:
@@ -861,4 +1017,4 @@ if __name__ == "__main__":
     except ValueError as exc:
         raise SystemExit(f"입력 오류: {exc}")
 
-    main(target_date=target_date)
+    main(target_date=target_date, dry_run=args.dry_run)

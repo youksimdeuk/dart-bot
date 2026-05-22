@@ -3,3 +3,5 @@
 .venv_backup/
 __pycache__/
 *.pyc
+dry_run.log
+*.log

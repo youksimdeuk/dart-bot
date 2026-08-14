@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   keepalive:
@@ -25,3 +26,14 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit --allow-empty -m "chore: keepalive (schedule 자동 비활성화 방지)"
           git push
+
+      # 2차 안전장치: bot 커밋이 비활성 카운터를 리셋하지 못하는 경우를 대비해
+      # dart_daily를 명시적으로 다시 활성화한다. 이미 active면 no-op.
+      - name: Re-enable daily workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X PUT \
+            "repos/${{ github.repository }}/actions/workflows/dart_daily.yml/enable"
+          gh api "repos/${{ github.repository }}/actions/workflows/dart_daily.yml" \
+            --jq '"dart_daily state: \(.state)"'

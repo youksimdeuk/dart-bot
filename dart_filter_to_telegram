@@ -303,20 +303,50 @@ def tg_get_chat_id_auto() -> Optional[str]:
     return None
 
 
+# 텔레그램은 한 대화방에 초당 1건을 넘기면 429를 돌려준다. 평소 하루 수십 건은
+# 문제없지만 소급 발송처럼 연속으로 쏠 때는 반드시 간격이 필요하다.
+TG_SEND_INTERVAL_SEC = float(os.getenv("TG_SEND_INTERVAL_SEC", "1.1"))
+TG_SEND_RETRIES = 5
+_tg_last_sent: float = 0.0
+
+
 def tg_send(text: str, chat_id: str) -> None:
+    global _tg_last_sent
     MAX = 3500
     chunks = [text[i:i + MAX] for i in range(0, len(text), MAX)] or [""]
     for chunk in chunks:
         payload = {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True}
-        resp = requests.post(f"{TG_BASE}/sendMessage", data=payload, timeout=20)
-        if resp.status_code != 200:
-            raise RuntimeError(f"텔레그램 전송 실패(status={resp.status_code}): {resp.text[:200]}")
-        try:
-            data = resp.json()
-        except ValueError as exc:
-            raise RuntimeError(f"텔레그램 응답 파싱 실패: {resp.text[:200]}") from exc
-        if not data.get("ok"):
-            raise RuntimeError(f"텔레그램 API 오류: {data}")
+
+        for attempt in range(1, TG_SEND_RETRIES + 1):
+            # 직전 전송으로부터 최소 간격 확보
+            wait = TG_SEND_INTERVAL_SEC - (time.monotonic() - _tg_last_sent)
+            if wait > 0:
+                time.sleep(wait)
+
+            resp = requests.post(f"{TG_BASE}/sendMessage", data=payload, timeout=20)
+            _tg_last_sent = time.monotonic()
+
+            if resp.status_code == 429:
+                # 텔레그램이 알려주는 대기 시간을 그대로 따른다
+                try:
+                    retry_after = int(resp.json().get("parameters", {}).get("retry_after", 5))
+                except ValueError:
+                    retry_after = 5
+                if attempt == TG_SEND_RETRIES:
+                    raise RuntimeError(f"텔레그램 429 재시도 소진: {resp.text[:200]}")
+                print(f"[warn] 텔레그램 429 — {retry_after}초 대기 후 재시도 ({attempt}/{TG_SEND_RETRIES})")
+                time.sleep(retry_after + 1)
+                continue
+
+            if resp.status_code != 200:
+                raise RuntimeError(f"텔레그램 전송 실패(status={resp.status_code}): {resp.text[:200]}")
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise RuntimeError(f"텔레그램 응답 파싱 실패: {resp.text[:200]}") from exc
+            if not data.get("ok"):
+                raise RuntimeError(f"텔레그램 API 오류: {data}")
+            break
 
 
 # ====== OpenDART 호출 ======
@@ -714,7 +744,7 @@ def is_asset_transfer_report(item: Dict) -> Tuple[bool, str]:
 
 
 # ====== 메인 ======
-def main(target_date: Optional[str] = None, dry_run: bool = False):
+def main(target_date: Optional[str] = None, dry_run: bool = False, min_stars: int = 1):
     if not DART_API_KEY:
         raise RuntimeError("DART_API_KEY가 필요합니다.")
 
@@ -787,6 +817,12 @@ def main(target_date: Optional[str] = None, dry_run: bool = False):
             })
             continue
 
+    # 신호강도 하한 적용(소급 발송처럼 분량을 줄여야 할 때 사용). 자산양수도는 등급이 없어 항상 통과.
+    if min_stars > 1:
+        before = len(major_hits)
+        major_hits = [x for x in major_hits if len(x.get("strength", "★")) >= min_stars]
+        print(f"[info] 신호강도 하한 {'★' * min_stars}: 임원공시 {before}건 → {len(major_hits)}건")
+
     passed_count = len(major_hits) + len(asset_hits)
 
     # ===== 메시지 구성: 공시 1건당 1메시지 =====
@@ -795,6 +831,8 @@ def main(target_date: Optional[str] = None, dry_run: bool = False):
         f"총 공시 {total_count}건 | 필터 통과 {passed_count}건\n"
         "발송 방식: 공시 1건당 1메시지"
     )
+    if min_stars > 1:
+        summary += f"\n(신호강도 {'★' * min_stars} 이상만 발송)"
     if _dropped_count:
         summary += (
             f"\n⚠️ DART 조회 실패로 판정 못한 공시 {_dropped_count}건"
@@ -876,6 +914,13 @@ if __name__ == "__main__":
         action="store_true",
         help="텔레그램 전송 없이 콘솔로만 출력 (로컬 테스트용)",
     )
+    parser.add_argument(
+        "--min-stars",
+        type=int,
+        choices=[1, 2, 3],
+        default=1,
+        help="임원공시 신호강도 하한 (3=★★★만). 소급 발송 시 분량 축소용",
+    )
     args = parser.parse_args()
 
     try:
@@ -884,7 +929,7 @@ if __name__ == "__main__":
         raise SystemExit(f"입력 오류: {exc}")
 
     try:
-        main(target_date=target_date, dry_run=args.dry_run)
+        main(target_date=target_date, dry_run=args.dry_run, min_stars=args.min_stars)
     except Exception as exc:
         # 실행이 죽으면 텔레그램이 그냥 조용해져서, 사용자는 "오늘 신호가 없는 것"과
         # "봇이 멈춘 것"을 구분할 수 없다. 최소한 실패 사실만은 알린다.

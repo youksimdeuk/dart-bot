@@ -1,0 +1,27 @@
+name: Keepalive
+
+# GitHub는 리포지토리에 60일간 활동이 없으면 schedule 트리거를 자동으로 끈다
+# (state: disabled_inactivity). 실제로 2026-07-22에 dart_daily가 이렇게 멈췄다.
+# 매월 1일 빈 커밋을 남겨 비활성 카운터를 리셋한다.
+
+on:
+  schedule:
+    - cron: "0 3 1 * *" # 매월 1일 12:00 KST
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Push empty commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keepalive (schedule 자동 비활성화 방지)"
+          git push

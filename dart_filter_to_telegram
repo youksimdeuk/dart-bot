@@ -39,6 +39,11 @@ if hasattr(sys.stdout, 'reconfigure'):
 load_dotenv()
 
 
+# 종가 조회 재시도 설정
+PRICE_FETCH_RETRIES = 3
+PRICE_FETCH_BACKOFF_SEC = 2
+
+
 # ====== 신호강도 분류 (★★★/★★/★) ======
 _PASSIVE_KEYWORDS: Optional[List[str]] = None
 
@@ -107,15 +112,27 @@ def get_close_price(stock_code: str, corp_cls: str, date_yyyymmdd: str) -> Optio
     ticker = f"{stock_code}{suffix}"
     try:
         import yfinance as yf
-        d = dt.datetime.strptime(date_yyyymmdd, "%Y%m%d")
-        start = d.strftime("%Y-%m-%d")
-        end = (d + dt.timedelta(days=7)).strftime("%Y-%m-%d")
-        df = yf.Ticker(ticker).history(start=start, end=end)
-        if df.empty:
-            return None
-        return float(df["Close"].iloc[0])
-    except (ImportError, ValueError, KeyError, IndexError, requests.RequestException):
+    except ImportError:
         return None
+
+    d = dt.datetime.strptime(date_yyyymmdd, "%Y%m%d")
+    start = d.strftime("%Y-%m-%d")
+    end = (d + dt.timedelta(days=7)).strftime("%Y-%m-%d")
+
+    # yfinance는 curl_cffi로 요청하므로 requests 예외 계열로는 타임아웃을 못 잡는다.
+    # 종가 조회 실패가 전체 실행을 죽이지 않도록 모든 예외를 삼키고 재시도한다.
+    for attempt in range(PRICE_FETCH_RETRIES):
+        try:
+            df = yf.Ticker(ticker).history(start=start, end=end)
+            if df.empty:
+                return None
+            return float(df["Close"].iloc[0])
+        except Exception as exc:
+            if attempt == PRICE_FETCH_RETRIES - 1:
+                print(f"[warn] 종가 조회 실패({ticker}): {type(exc).__name__}: {exc}")
+                return None
+            time.sleep(PRICE_FETCH_BACKOFF_SEC * (attempt + 1))
+    return None
 
 
 def classify_signal_strength(

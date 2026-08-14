@@ -393,32 +393,49 @@ def dart_list(bgn_de: str, end_de: str) -> List[Dict]:
     return out
 
 
+# 두 API 모두 corp_code 단위로 해당 법인의 전체 목록을 돌려준다. 한 법인이
+# 하루에 여러 건을 공시하면 같은 목록을 반복해서 받게 되므로(2026-08-14 기준
+# 103건 중 51건이 중복) 법인 단위로 한 번만 받아 재사용한다.
+_corp_items_cache: Dict[Tuple[str, str], List[Dict]] = {}
+
+
+def _dart_corp_items(endpoint: str, corp_code: str, context: str) -> Optional[List[Dict]]:
+    key = (endpoint, corp_code)
+    if key in _corp_items_cache:
+        return _corp_items_cache[key]
+
+    params = {"crtfc_key": DART_API_KEY, "corp_code": corp_code}
+    data = dart_get(endpoint, params, context)
+    if data is None:
+        return None  # 실패는 캐시하지 않는다 — 다음 공시에서 다시 시도한다
+    items = data.get("list", []) or []
+    _corp_items_cache[key] = items
+    return items
+
+
+def _pick_by_rcept(items: List[Dict], rcept_no: str) -> Dict:
+    for it in items:
+        if str(it.get("rcept_no", "")) == str(rcept_no):
+            return it
+    return {}
+
+
 def dart_majorstock_item(corp_code: str, rcept_no: str) -> Dict:
     """majorstock.json에서 rcept_no에 해당하는 1개 항목(dict) 반환(없으면 빈 dict)."""
-    params = {"crtfc_key": DART_API_KEY, "corp_code": corp_code}
-    data = dart_get("majorstock.json", params, f"대량보유 {rcept_no}")
-    if data is None:
+    items = _dart_corp_items("majorstock.json", corp_code, f"대량보유 {rcept_no}")
+    if items is None:
         note_dropped(f"대량보유 {rcept_no}")
         return {}
-    items = data.get("list", [])
-    candidates = [it for it in items if str(it.get("rcept_no", "")) == str(rcept_no)]
-    if candidates:
-        return candidates[0]
-    return {}
+    return _pick_by_rcept(items, rcept_no)
 
 
 def dart_elestock_item(corp_code: str, rcept_no: str) -> Dict:
     """elestock.json에서 rcept_no에 해당하는 1개 항목(dict) 반환(없으면 빈 dict)."""
-    params = {"crtfc_key": DART_API_KEY, "corp_code": corp_code}
-    data = dart_get("elestock.json", params, f"임원/주요주주 {rcept_no}")
-    if data is None:
+    items = _dart_corp_items("elestock.json", corp_code, f"임원/주요주주 {rcept_no}")
+    if items is None:
         note_dropped(f"임원/주요주주 {rcept_no}")
         return {}
-    items = data.get("list", [])
-    candidates = [it for it in items if str(it.get("rcept_no", "")) == str(rcept_no)]
-    if candidates:
-        return candidates[0]
-    return {}
+    return _pick_by_rcept(items, rcept_no)
 
 
 def dart_elestock_actor(item: Dict) -> str:
@@ -670,8 +687,11 @@ KW_ASSET_TRANSFER = [
 # 자산유동화(ABS) 노이즈 제외.
 # "신한카드이천이십사의이유동화전문유한회사" 같은 SPC가 매일 '자산양도등의등록신청서'를
 # 무더기로 올리는데, 이건 카드채권 유동화 절차일 뿐 투자 신호가 아니다.
-KW_ASSET_EXCLUDE_CORP = ["유동화전문", "유동화회사", "특수목적", "제이차", "유한회사"]
-KW_ASSET_EXCLUDE_REPORT = ["자산양도등의등록신청서", "자산유동화계획", "등록신청서"]
+# 상장사만 통과시키는 종목코드 조건이 사실상 SPC를 다 걸러내므로, 아래 키워드는
+# 좁고 확실한 것만 둔다. "유한회사"·"등록신청서" 같은 넓은 말은 정상 공시를
+# 잘못 거를 위험만 있고 실익이 없어 쓰지 않는다.
+KW_ASSET_EXCLUDE_CORP = ["유동화전문", "유동화회사"]
+KW_ASSET_EXCLUDE_REPORT = ["자산양도등의등록신청서", "자산유동화계획"]
 
 
 def is_asset_transfer_report(item: Dict) -> Tuple[bool, str]:
@@ -863,4 +883,19 @@ if __name__ == "__main__":
     except ValueError as exc:
         raise SystemExit(f"입력 오류: {exc}")
 
-    main(target_date=target_date, dry_run=args.dry_run)
+    try:
+        main(target_date=target_date, dry_run=args.dry_run)
+    except Exception as exc:
+        # 실행이 죽으면 텔레그램이 그냥 조용해져서, 사용자는 "오늘 신호가 없는 것"과
+        # "봇이 멈춘 것"을 구분할 수 없다. 최소한 실패 사실만은 알린다.
+        alert = (
+            f"🚨 DART 봇 실행 실패 (KST {target_date})\n"
+            f"{type(exc).__name__}: {exc}"
+        )
+        print(alert)
+        if not args.dry_run and TG_TOKEN and TG_CHAT_ID:
+            try:
+                tg_send(alert, TG_CHAT_ID)
+            except Exception as send_exc:
+                print(f"[warn] 실패 알림 전송도 실패: {send_exc}")
+        raise
